@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>humanarm_mode</name>
+  <version>0.1.0</version>
+  <description>DROK ARM HumanArm mode and 1 kHz smooth IK motion.</description>
+  <maintainer email="noreply@example.com">jhj0129</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
