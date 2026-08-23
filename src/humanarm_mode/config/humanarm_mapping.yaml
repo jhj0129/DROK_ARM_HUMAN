@@ -1,0 +1,15 @@
+# Field-validated hardware/model mapping.
+kinematic_mapping:
+  model_home_rad:
+    [-0.000001628, 0.297361544, 0.296742637, -0.000030712, 0.000061231, 0.000102331]
+  legacy_raw_home_deg:
+    [5.109444444444445, 33.330833, 21.615833, 30.480000, 0.380000, -3.444722222222]
+
+session:
+  # Verified real-arm relationship:
+  # Legacy J6 -> clockwise 90 deg -> HumanArm J6 Home.
+  j6_legacy_to_human_delta_deg: -90.0
+
+  # Relative FULL OPEN -> CLOSED travel for J7.
+  # Absolute J7 RAW is captured at each power-on.
+  j7_close_travel_deg: 87.721111166667
