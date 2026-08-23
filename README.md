@@ -1,614 +1,433 @@
-# DROK ARM HUMAN
+# DROK_ARM_Sim_only
 
-DROK 6-DOF 로봇팔의 HumanArm Mode, 전원 재인가 기준점 처리, 실제팔 Home 이동, 1 kHz 부드러운 관절 궤적, Full-Pose DLS IK 기반 Pick 테스트를 위한 ROS 2 Humble 워크스페이스입니다.
+DROK ARM용 **ROS 2 Humble + MuJoCo 시뮬레이션 / 실시간 RC 개발 워크스페이스**입니다.
 
-Repository
-https://github.com/jhj0129/DROK_ARM_HUMAN
-
----
-
-## 1. 현재 구현 기능
-
-- 실제 RMD 모터 RAW angle 모니터링
-- can10 / can11 SocketCAN 사용
-- J1~J6 HumanArm Home
-- J6 전원 재인가 Session Reference
-- J7 전원 재인가 FULL OPEN Session Reference
-- 전원 ON 후 처진 자세 -> 기존 Legacy Home -> HumanArm Home 자동 이동
-- ARM_BASE_LINK 기준 Full-Pose DLS IK
-- 1 kHz 관절 명령 스트리밍
-- 9th-order smootherstep trajectory
-- J5 미세 헌팅 감소용 저속/고해상도 명령
-- 그리퍼 FULL OPEN -> 접근 -> CLOSE -> 물체를 잡은 채 HumanArm Home 복귀
-- 테스트 Pick target: ARM_BASE_LINK 기준 X = +0.60 m
+현재 개발의 중심 목표는 **Meta Quest 3 기반 초저지연 VR RC 제어**입니다. 정밀한 자동화용 trajectory tracking보다 사람이 화면을 보면서 즉시 조작하는 Human-in-the-loop RC를 우선하며, 위치·자세 오차는 비교적 러프하게 허용하고 **응답성, 1:1 추종감, 낮은 제어 지연**을 최우선으로 둡니다.
 
 ---
 
-## 2. 기준 환경
+## Current verified status
 
-- Ubuntu Linux
-- ROS 2 Humble
-- SocketCAN
-- CAN interface:
-  - can10
-  - can11
-- CAN bitrate:
-  - 1 Mbps
+현재 확인된 항목:
 
-Python/ROS dependency는 build.sh에서 rosdep으로 설치하도록 구성되어 있습니다.
+- ROS 2 Humble + MuJoCo simulation backend
+- JOINT1 ~ JOINT6 arm simulation
+- JOINT7 gripper interface
+- `/joint_states` feedback
+- `/drok_arm/joint_command` direct command
+- calibrated HumanArm pose 기반 테스트
+- endpoint FK / IK
+- 1 kHz realtime RC controller
+- 1:1 relative Cartesian VR mapping
+- Geometric Jacobian
+- Differential resolved-rate control
+- latest-pose-only QoS (`KEEP_LAST(1)`, `BEST_EFFORT`)
+- VR Cartesian velocity feed-forward
+- direct 6x6 Jacobian solve in normal operation
+- geometric arm/wrist singularity monitoring
+- Singularity Firewall v1
+- emergency-only DLS fallback
+- fake 120 Hz VR keyboard input for Quest-free testing
 
-IK 및 기존 실제팔 bridge는 아래 저장소의 검증된 commit을 build.sh가 자동으로 받아옵니다.
+실시간 RC 초기 시험에서 기존 Adaptive-DLS 버전은 일반적으로 다음 계산 성능을 확인했습니다.
 
-DROK_ARM_IK
-https://github.com/jhj0129/DROK_ARM_IK
+```text
+Control period avg      ~= 1000 us
+Controller compute avg  ~= 25 ~ 40 us
+Typical compute max     ~= 70 ~ 230 us
+VR sample age           ~= 0 ~ 8 ms @ 120 Hz fake input
+```
 
-Pinned commit:
-26be1ec8480b0b44a26221fec2810bd5a38951be
-
-따라서 사용자가 별도로 DROK_ARM_IK를 clone할 필요는 없습니다.
+현재 Fast-Path + Singularity Firewall 버전에서는 normal path의 eigen decomposition / sigma_min 계산 / 상시 DLS를 제거하고 direct solve를 사용합니다.
 
 ---
 
-## 3. Clone
+## VR RC design goal
 
-```bash
-cd ~
-git clone https://github.com/jhj0129/DROK_ARM_HUMAN.git
-cd ~/DROK_ARM_HUMAN
+목표는 다음과 같습니다.
+
+```text
+Quest controller 10 cm 이동
+        ->
+Robot TCP 약 10 cm 이동
+
+Quest controller 20 deg 회전
+        ->
+Robot wrist 약 20 deg 회전
+```
+
+기본 mapping:
+
+```text
+Translation scale = 1.0
+Rotation scale    = 1.0
+```
+
+RC는 높은 정밀도보다 사람이 실제 로봇을 보면서 즉시 보정하는 방식에 맞춰 설계합니다.
+
+우선순위:
+
+```text
+1. Responsiveness
+2. Low latency
+3. Natural 1:1 tracking
+4. Singularity prevention / safe fallback
+5. Precision
 ```
 
 ---
 
-## 4. Build
+## Realtime RC architecture
 
-최초 1회:
-
-```bash
-cd ~/DROK_ARM_HUMAN
-bash build.sh
+```text
+Meta Quest 3 / Fake VR input
+          |
+          | latest pose only
+          v
++----------------------------------+
+| Realtime RC Controller : 1000 Hz |
+|                                  |
+| Relative 1:1 VR target           |
+|        |                         |
+| Cartesian error + feed-forward   |
+|        |                         |
+| Geometric Jacobian               |
+|        |                         |
+| FAST direct solve                |
+|        |                         |
+| Singularity Firewall             |
+|        |                         |
+| Joint velocity clamp             |
+|        |                         |
+| q_cmd += qdot * 0.001            |
++----------------------------------+
+          |
+          v
+/drok_arm/joint_command
+          |
+          v
+MuJoCo / future real RMD-CAN bridge
 ```
 
-build.sh가 자동으로 수행하는 작업:
+Normal operation에서는 iterative pose IK를 사용하지 않습니다.
 
-1. ROS 2 Humble 환경 source
-2. 검증된 DROK_ARM_IK commit 다운로드
-3. drok_arm_kinematics 연결
-4. drok_real_arm_bridge 연결
-5. rosdep dependency 설치
-6. colcon build --symlink-install
-7. 실행 shell script에 실행 권한 부여
+```text
+No 8 / 16 / N iteration IK convergence loop
+No trajectory queue for VR tracking
+No heavy smoothing buffer
+No old-pose processing
+```
 
-빌드 후 수동 source가 필요한 경우:
+매 제어 cycle에서 최신 VR target을 기준으로 한 번 계산하고 바로 다음 joint command를 생성합니다.
+
+---
+
+## FAST solve + Singularity Firewall
+
+### Normal region
+
+정상 영역에서는 damping 없이 direct solve를 사용합니다.
+
+```text
+Geometric Jacobian J
+      |
+      v
+J * qdot = desired_twist
+      |
+      v
+FAST direct solve
+```
+
+상시 SVD / eigen decomposition / Adaptive-DLS를 사용하지 않습니다.
+
+### Known singularity metrics
+
+Arm/elbow singularity metric:
+
+```text
+arm_metric = |u_upper x u_forearm|
+```
+
+- `1.0`에 가까움: 링크 방향이 충분히 다름
+- `0.0`에 가까움: arm links가 일직선 / anti-parallel에 가까움
+
+Wrist singularity metric:
+
+```text
+wrist_metric = |axis_J4 x axis_J6|
+```
+
+- `1.0`에 가까움: J4/J6 world axis가 충분히 다름
+- `0.0`에 가까움: J4/J6 world axis가 평행 / 반평행
+
+### Firewall behavior
+
+현재 v1 Firewall은 30 ms look-ahead를 사용해 known singular geometry로 더 가까워지는 방향인지 확인합니다.
+
+```text
+SAFE
+  -> VR command 그대로 통과
+
+WARNING
+  -> singularity 방향 component만 점진 감쇠
+
+HARD boundary
+  -> 해당 singularity 쪽 component 차단
+
+Away from singularity
+  -> 제한하지 않음
+```
+
+기본값:
+
+```yaml
+firewall_arm_warning_metric: 0.15
+firewall_arm_hard_metric: 0.05
+
+firewall_wrist_warning_metric: 0.20
+firewall_wrist_hard_metric: 0.10
+
+firewall_lookahead_sec: 0.030
+```
+
+> 현재 Firewall v1은 DROK ARM의 알려진 arm/wrist singular geometry를 대상으로 한 **geometric heuristic prevention layer**입니다. Formal Control Barrier Function의 forward-invariance를 수학적으로 증명한 구현은 아직 아닙니다. 이후 필요하면 gradient/CBF projection 기반 Firewall v2로 확장합니다.
+
+### Emergency DLS
+
+DLS는 normal path에서 사용하지 않고 다음 경우에만 fallback으로 사용합니다.
+
+```text
+Jacobian rank loss
+Direct solution NaN / Inf
+Raw joint velocity abnormal spike
+```
+
+기본값:
+
+```yaml
+emergency_dls_lambda: 0.080
+emergency_raw_qdot_rad_s: 20.0
+```
+
+---
+
+## ROS 2 topics
+
+```text
+VR pose        : /vr/right_hand_pose
+VR relink      : /vr/relink
+Robot command  : /drok_arm/joint_command
+Robot feedback : /joint_states
+```
+
+Realtime RC 관련 topic은 stale command 누적을 막기 위해 기본적으로:
+
+```text
+KEEP_LAST(1)
+BEST_EFFORT
+```
+
+를 사용합니다.
+
+RC에서는 과거 pose를 순서대로 처리하는 것보다 **가장 최신 pose 하나만 사용하는 것**이 중요합니다.
+
+---
+
+## Repository structure
+
+```text
+DROK_ARM_Sim_only/
+├── README.md
+├── config/
+├── docs/
+├── src/
+│   ├── drok_arm_description/
+│   ├── drok_arm_kinematics/
+│   ├── drok_arm_mujoco/
+│   └── drok_realtime_rc/
+│       ├── CMakeLists.txt
+│       ├── package.xml
+│       ├── config/
+│       │   └── realtime_rc.yaml
+│       └── src/
+│           └── realtime_rc_controller.cpp
+└── tools/
+    ├── setup.sh
+    ├── source_env.sh
+    ├── run_sim.sh
+    ├── go_home.sh
+    └── fake_vr_keyboard.py
+```
+
+---
+
+## Build
 
 ```bash
+cd ~/DROK_ARM_Sim_only
+
 source /opt/ros/humble/setup.bash
-source ~/DROK_ARM_HUMAN/install/setup.bash
+
+colcon build --symlink-install
+
+source ~/DROK_ARM_Sim_only/install/setup.bash
 ```
 
----
-
-## 5. CAN 확인
-
-로봇 실행 전 can10 / can11이 존재하고 UP 상태여야 합니다.
+Realtime RC만 다시 빌드할 경우:
 
 ```bash
-ip -details link show can10
-ip -details link show can11
-```
-
-정상 예:
-
-```text
-can state ERROR-ACTIVE
-bitrate 1000000
-```
-
-CAN interface 설정은 사용하는 USB-CAN 장치에 맞게 별도로 수행합니다.
-
----
-
-## 6. 실제 모터 Mapping
-
-Logical joints:
-
-- J1: Shoulder Yaw
-- J2: Shoulder Pitch
-- J3: Elbow Pitch
-- J4: Wrist Yaw
-- J5: Wrist Pitch
-- J6: Wrist Roll
-- J7: Gripper
-
-Physical CAN mapping:
-
-```text
-J1       can10  0x141
-J2_MAIN  can10  0x142
-J2_SLAVE can10  0x143
-J3       can10  0x144
-
-J4       can11  0x141
-J5       can11  0x142
-J6       can11  0x143
-J7       can11  0x144
-```
-
-Gear / angle convention used by HumanArm:
-
-```text
-J1  36:1
-J2  36:1
-J3  36:1
-J4   1:1
-J5   1:1
-J6   6:1
-J7   6:1
-```
-
----
-
-## 7. 중요한 J6 / J7 전원 ON 규칙
-
-J6과 J7은 이전 부팅의 고정 RAW angle을 절대적인 물리 자세 기준으로 사용하지 않습니다.
-
-전원을 넣을 때 실제 로봇은 반드시 다음 상태로 시작합니다.
-
-```text
-J6 = 기존 Legacy 방향
-J7 = Gripper FULL OPEN
-```
-
-전원이 켜지면 현재 RAW를 이번 세션의 기준점으로 저장합니다.
-
-J6:
-
-```text
-이번 부팅의 Legacy RAW
-        ↓
-시계방향 90 deg
-        ↓
-HumanArm J6 Home
-```
-
-software relation:
-
-```text
-J6 HumanArm Home RAW
-=
-J6 Boot Legacy RAW - 90 deg
-```
-
-J7:
-
-```text
-전원 ON 시 현재 RAW = FULL OPEN
-```
-
-그리퍼 닫힘은 FULL OPEN 기준 상대 이동으로 계산합니다.
-
-```text
-J7 close travel ≈ +87.7211 deg
-```
-
-Session file:
-
-```text
-~/.cache/drok_arm_human/session_reference.yaml
-```
-
-이 파일은 매 전원 ON 세션마다 새로 생성됩니다.
-
----
-
-## 8. 전원 ON 후 HumanArm Home 이동
-
-전원을 켰을 때 J2/J3가 중력 때문에 아래로 처져 있어도 괜찮습니다.
-
-실행:
-
-```bash
-cd ~/DROK_ARM_HUMAN
-./go_humanarm_home.sh
-```
-
-최초 build 직후 실행권한 문제가 있으면:
-
-```bash
-bash go_humanarm_home.sh
-```
-
-동작 순서:
-
-```text
-POWER ON
-   ↓
-현재 J6 Legacy RAW 캡처
-현재 J7 FULL OPEN RAW 캡처
-   ↓
-MOVE_ARM 확인
-   ↓
-현재 처진 자세
-   ↓
-Legacy Home
-J1 HOLD
-J2~J5 Legacy Home
-J6 HOLD
-   ↓
-Legacy bridge 종료
-   ↓
-HumanArm Home
-J1~J5 calibrated Home
-J6 = 이번 세션 Legacy - 90 deg
-J7 = FULL OPEN 유지
-```
-
-실행 중:
-
-```text
-실행하려면 MOVE_ARM 입력:
-```
-
-이 나오면 주변 상태를 확인하고:
-
-```text
-MOVE_ARM
-```
-
-을 입력합니다.
-
----
-
-## 9. HumanArm RAW Monitor
-
-수동으로 모터 RAW 값을 보고 싶을 때:
-
-Terminal 1:
-
-```bash
+cd ~/DROK_ARM_Sim_only
 source /opt/ros/humble/setup.bash
-source ~/DROK_ARM_HUMAN/install/setup.bash
 
-ros2 run humanarm_mode humanarm_motor_monitor
-```
+colcon build \
+  --symlink-install \
+  --packages-select drok_realtime_rc
 
-Terminal 2:
-
-```bash
-ros2 topic echo /humanarm/raw_motor_deg
-```
-
-배열 순서:
-
-```text
-[
-  J1,
-  J2_MAIN,
-  J2_SLAVE,
-  J3,
-  J4,
-  J5,
-  J6,
-  J7
-]
+source ~/DROK_ARM_Sim_only/install/setup.bash
 ```
 
 ---
 
-## 10. HumanArm 상태 확인
+## Run realtime RC test without Quest 3
 
-Raw monitor가 실행 중인 상태에서:
-
-```bash
-ros2 run humanarm_mode humanarm_session_control status
-```
-
-HumanArm Home에서는 J1~J6 HOME_ERR가 거의 0 deg 근처여야 합니다.
-
----
-
-## 11. 60 cm IK Pick 테스트
-
-먼저 반드시 현재 전원 세션에서 HumanArm Home 이동을 완료합니다.
+### Terminal 1 - MuJoCo
 
 ```bash
-cd ~/DROK_ARM_HUMAN
-./go_humanarm_home.sh
+cd ~/DROK_ARM_Sim_only
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+./tools/run_sim.sh
 ```
 
-그 다음:
+### Terminal 2 - Realtime RC controller
 
 ```bash
-./pick_60cm.sh
+cd ~/DROK_ARM_Sim_only
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+ros2 run drok_realtime_rc realtime_rc_controller \
+  --ros-args \
+  --params-file \
+  /home/$USER/DROK_ARM_Sim_only/src/drok_realtime_rc/config/realtime_rc.yaml
 ```
 
-Pick sequence:
+정상 시작 예:
 
 ```text
-HumanArm Home
-      ↓
-J7 FULL OPEN
-      ↓
-Full-Pose DLS IK
-ARM_BASE_LINK 기준 TCP X = +0.60 m
-현재 Y/Z 및 TCP orientation 유지
-      ↓
-1 kHz smooth joint trajectory
-      ↓
-J7 CLOSE / GRASP
-      ↓
-물체 파지 유지
-      ↓
-HumanArm Home 복귀
-      ↓
-J7 CLOSED 유지
+Control       : 1000 Hz
+Mapping       : translation 1.00 : 1 / rotation 1.00 : 1
+Jacobian      : geometric
+IK            : FAST direct solve + geometric firewall
+Emergency     : DLS fallback only
+QoS           : KEEP_LAST(1), BEST_EFFORT
 ```
+
+### Terminal 3 - Fake VR input
+
+```bash
+cd ~/DROK_ARM_Sim_only
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+python3 tools/fake_vr_keyboard.py
+```
+
+Keyboard mapping:
+
+```text
+W / S : +X / -X
+A / D : +Y / -Y
+R / F : +Z / -Z
+
+U / O : +Roll  / -Roll
+I / K : +Pitch / -Pitch
+J / L : +Yaw   / -Yaw
+
+0     : Relink current VR pose to current robot TCP
+Q     : Quit
+```
+
+Fake VR publishes at 120 Hz.
 
 ---
 
-## 12. IK 방식
+## Diagnostic log
 
-IK solver:
-
-```text
-Full-Pose Damped Least Squares
-```
-
-Target:
+Realtime controller prints approximately once per second:
 
 ```text
-Base frame : ARM_BASE_LINK
-Tool frame : gripper_tcp
-
-Target X   : 0.600 m
-Target Y   : 현재 TCP Y 유지
-Target Z   : 현재 TCP Z 유지
-Target RPY : 현재 TCP orientation 유지
+period avg/max=... us
+compute avg/max=... us
+VR age=... ms
+err=... mm / ... deg
+arm=...
+wrist=...
+mode=...
+q track max=... deg
 ```
 
-현재 HumanArm Home에서 실제 확인된 예:
+`mode` values:
 
 ```text
-Start TCP X ≈ 0.3603 m
-Target TCP X = 0.6000 m
+FAST
+FIREWALL_ARM
+FIREWALL_WRIST
+FIREWALL_ARM+WRIST
+DLS_EMERGENCY
 ```
 
-따라서 현재 데모에서는 약 24 cm 정도 앞으로 뻗습니다.
+Normal teleoperation에서는 대부분 `FAST`가 유지되는 것이 목표입니다.
 
 ---
 
-## 13. Smooth Motion
+## Current controller philosophy
 
-실제 모터 이동 완성도를 위해 관절 궤적은 다음 설정을 사용합니다.
+정밀 자동화와 VR RC는 같은 controller requirement를 갖지 않습니다.
+
+### Autonomous / endpoint motion
+
+사용 가능:
 
 ```text
-Control / stream rate : 1000 Hz
-Nominal period        : 1.000 ms
-Trajectory            : 9th-order smootherstep
+Endpoint IK
+Trajectory interpolation
+Completion tolerance
+Settle check
 ```
 
-9th-order smootherstep은 시작/종료에서 다음 값이 0이 되도록 구성했습니다.
+### VR RC
+
+우선 사용:
 
 ```text
-velocity
-acceleration
-jerk
-snap
-```
-
-J5는 손목 하중과 작은 setpoint에서 보였던 미세 흔들림을 줄이기 위해:
-
-```text
-minimum protocol speed = 3
-command quantum        = 1 encoder count
-                       ≈ 0.01 deg
-```
-
-을 사용합니다.
-
-또한 encoder count 명령은 진행 방향에 대해 monotonic하게 제한합니다.
-
----
-
-## 14. 실제 측정된 1 kHz timing 예
-
-실제 Pick 테스트에서 측정:
-
-Forward:
-
-```text
-Average period : 1.0000 ms
-Maximum period : 1.1246 ms
-> 1.5 ms       : 0 / 12000
-> 2.0 ms       : 0 / 12000
-```
-
-Return:
-
-```text
-Average period : 1.0000 ms
-Maximum period : 1.0662 ms
-> 1.5 ms       : 0 / 12000
-> 2.0 ms       : 0 / 12000
-```
-
-따라서 해당 Ubuntu 환경에서는 Python 기반 trajectory streamer로도 1 kHz 주기가 안정적으로 확인되었습니다.
-
----
-
-## 15. 실제 확인된 Pick 결과 예
-
-IK result:
-
-```text
-Success        : true
-Iterations     : 16
-Position error : 0.000000131 m
-```
-
-Target:
-
-```text
-ARM_BASE_LINK X = 0.600 m
-```
-
-Gripper:
-
-```text
-FULL OPEN
-24.96 deg
-
-→
-
-CLOSED
-112.68 deg
-```
-
-동작 종료 후 로봇은 HumanArm Home으로 돌아오고 J7은 닫힌 상태를 유지합니다.
-
----
-
-## 16. 주요 파일
-
-```text
-DROK_ARM_HUMAN/
-├── build.sh
-├── go_humanarm_home.sh
-├── pick_60cm.sh
-└── src/
-    └── humanarm_mode/
-        ├── package.xml
-        ├── setup.py
-        ├── setup.cfg
-        ├── config/
-        │   ├── humanarm_home.yaml
-        │   ├── humanarm_mapping.yaml
-        │   └── robot_geometry.yaml
-        └── humanarm_mode/
-            ├── common.py
-            ├── raw_monitor.py
-            ├── boot_reference.py
-            ├── session_control.py
-            ├── legacy_home_once.py
-            └── pick_60cm.py
-```
-
-build.sh 실행 후 자동으로 다음 검증된 dependency가 `.deps/`에 생성됩니다.
-
-```text
-.deps/DROK_ARM_IK
-```
-
-그리고 아래 ROS package가 workspace의 src에 연결됩니다.
-
-```text
-drok_arm_kinematics
-drok_real_arm_bridge
+Latest pose only
+1:1 relative mapping
+Velocity feed-forward
+Geometric Jacobian
+One solve per 1 ms cycle
+Loose error acceptance
+Human visual feedback
+Singularity prevention firewall
+Emergency-only DLS
 ```
 
 ---
 
-## 17. 주요 명령 요약
+## Next development steps
 
-Build:
-
-```bash
-cd ~/DROK_ARM_HUMAN
-bash build.sh
-```
-
-HumanArm Home:
-
-```bash
-cd ~/DROK_ARM_HUMAN
-./go_humanarm_home.sh
-```
-
-60 cm Pick:
-
-```bash
-cd ~/DROK_ARM_HUMAN
-./pick_60cm.sh
-```
-
-RAW monitor:
-
-```bash
-ros2 run humanarm_mode humanarm_motor_monitor
-```
-
-Status:
-
-```bash
-ros2 run humanarm_mode humanarm_session_control status
-```
-
-J6만 HumanArm Home:
-
-```bash
-ros2 run humanarm_mode humanarm_session_control j6-home
-```
-
-J6만 이번 세션 Legacy 위치:
-
-```bash
-ros2 run humanarm_mode humanarm_session_control j6-legacy
-```
-
----
-
-## 18. 실행 시 주의
-
-동시에 둘 이상의 위치제어 CAN writer를 실행하지 마십시오.
-
-예:
+현재 다음 우선순위로 진행합니다.
 
 ```text
-moveit_to_rmd_bridge
-joystick_to_rmd_control
-drokck
-HumanArm direct controller
+1. Fast-Path + Singularity Firewall timing/behavior 검증
+2. Actual q feedback 기반 TCP tracking 분리 측정
+3. Command lead limiter 추가
+4. Linux realtime scheduling / CPU affinity 적용
+5. Meta Quest 3 actual pose stream 연결
+6. Real RMD/CAN bridge 연결
+7. 실물 VR RC latency measurement
+8. 필요 시 CBF-style Singularity Firewall v2
 ```
 
-Pick runner는 일부 대표적인 충돌 node를 검사해서 실행을 차단합니다.
-
-Raw monitor는 read request를 보내고 feedback을 받는 용도입니다.
-
-로봇을 실제로 구동하기 전:
-
-```text
-can10 UP
-can11 UP
-J6 power-on Legacy orientation
-J7 FULL OPEN
-주변 작업공간 확인
-비상정지 사용 가능 상태
-```
-
-를 확인합니다.
-
----
-
-## 19. 현재 기준
-
-이 저장소의 현재 기준 기능:
-
-```text
-Power ON
-→ Sagged Arm
-→ Legacy Home
-→ HumanArm Home
-→ J7 Open
-→ Full-Pose IK to X=0.60 m
-→ J7 Grasp
-→ HumanArm Home
-```
-
-HumanArm 동작의 핵심 기준은 다음입니다.
-
-```text
-J1~J5 : calibrated static HumanArm Home
-J6    : power-on session-relative Home
-J7    : power-on session-relative FULL OPEN
-```
-
-J6/J7의 이전 부팅 absolute RAW 값은 물리적 절대 자세 기준으로 사용하지 않습니다.
+최종 목표는 **사람이 VR 컨트롤러를 움직이는 순간 DROK ARM이 가능한 한 같은 움직임을 즉시 따라가는 초저지연 Human-in-the-loop RC 시스템**입니다.
