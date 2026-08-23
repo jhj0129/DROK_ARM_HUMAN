@@ -86,6 +86,27 @@ def matrix_to_rpy(r):
     return roll, pitch, yaw
 
 
+def orientation_error_deg(target_rotation, actual_rotation):
+    r_err = target_rotation.T @ actual_rotation
+    value = (float(np.trace(r_err)) - 1.0) * 0.5
+    value = max(-1.0, min(1.0, value))
+    return math.degrees(math.acos(value))
+
+
+def tolerance_settings():
+    cfg = load_yaml("control_tolerance.yaml")
+    ik = cfg["ik"]
+    completion = cfg["completion"]
+    return {
+        "ik_position_m": float(ik["position_tolerance_m"]),
+        "ik_orientation_rad": float(ik["orientation_tolerance_rad"]),
+        "joint_deg": float(completion["joint_tolerance_deg"]),
+        "tcp_position_m": float(completion["tcp_position_tolerance_m"]),
+        "tcp_orientation_deg": float(completion["tcp_orientation_tolerance_deg"]),
+        "settle_sec": float(completion["settle_time_sec"]),
+    }
+
+
 def mapping_arrays():
     m = load_yaml("humanarm_mapping.yaml")
     return (
@@ -112,7 +133,7 @@ def model_q_to_raw(q, session, model_home, legacy_raw_home):
     return targets
 
 
-def solve_full_pose(target_xyz, target_rpy, seed_q):
+def solve_full_pose(target_xyz, target_rpy, seed_q, tol):
     args = [
         "ros2", "run", "drok_arm_kinematics", "solve_ik_pose", geometry_path(),
         *(f"{float(v):.12f}" for v in target_xyz),
@@ -121,6 +142,8 @@ def solve_full_pose(target_xyz, target_rpy, seed_q):
     ]
     env = os.environ.copy()
     env["DROK_IK_MODE"] = "full"
+    env["DROK_IK_POSITION_TOLERANCE_M"] = f"{tol['ik_position_m']:.12g}"
+    env["DROK_IK_ORIENTATION_TOLERANCE_RAD"] = f"{tol['ik_orientation_rad']:.12g}"
     result = subprocess.run(args, env=env, text=True, capture_output=True)
     print(result.stdout)
     if result.returncode != 0:
@@ -134,6 +157,32 @@ def solve_full_pose(target_xyz, target_rpy, seed_q):
     if len(values) != 6:
         raise RuntimeError("IK result joint count != 6")
     return np.asarray(values, dtype=float)
+
+
+def completion_report(title, q_target, q_actual, tol):
+    target_t = fk(q_target)
+    actual_t = fk(q_actual)
+    joint_error_deg = np.abs(np.degrees(q_actual - q_target))
+    position_error_m = float(np.linalg.norm(actual_t[:3,3] - target_t[:3,3]))
+    orientation_error = orientation_error_deg(target_t[:3,:3], actual_t[:3,:3])
+
+    joint_pass = bool(np.all(joint_error_deg <= tol["joint_deg"]))
+    position_pass = position_error_m <= tol["tcp_position_m"]
+    orientation_pass = orientation_error <= tol["tcp_orientation_deg"]
+    passed = joint_pass and position_pass and orientation_pass
+
+    print("\n" + "="*76)
+    print(f" {title}")
+    print("="*76)
+    for i, joint in enumerate(ARM_JOINTS):
+        flag = "PASS" if joint_error_deg[i] <= tol["joint_deg"] else "FAIL"
+        print(f"{joint}: error={joint_error_deg[i]:.3f} deg / {tol['joint_deg']:.3f} deg  {flag}")
+    print(f"TCP position    : {position_error_m*1000.0:.3f} mm / {tol['tcp_position_m']*1000.0:.1f} mm")
+    print(f"TCP orientation : {orientation_error:.3f} deg / {tol['tcp_orientation_deg']:.1f} deg")
+    print(f"Post-settle     : {tol['settle_sec']:.2f} sec minimum (trajectory endpoint hold is longer)")
+    print("RESULT          : " + ("PASS" if passed else "FAIL"))
+    print("="*76)
+    return passed
 
 
 def print_raw(title, raw):
@@ -157,6 +206,14 @@ def main():
     model_home, legacy_raw_home = mapping_arrays()
     mapping = load_yaml("humanarm_mapping.yaml")
     close_travel = float(mapping["session"]["j7_close_travel_deg"])
+    tol = tolerance_settings()
+
+    print("\nDROK HumanArm tolerance:")
+    print(f"  IK position       : {tol['ik_position_m']*1000.0:.3f} mm")
+    print(f"  IK orientation    : {math.degrees(tol['ik_orientation_rad']):.3f} deg")
+    print(f"  Joint completion  : +/- {tol['joint_deg']:.3f} deg")
+    print(f"  TCP position      : +/- {tol['tcp_position_m']*1000.0:.1f} mm")
+    print(f"  TCP orientation   : +/- {tol['tcp_orientation_deg']:.1f} deg")
 
     raw_start = read_raw()
     print_raw("START RAW", raw_start)
@@ -179,7 +236,7 @@ def main():
     print(" FULL-POSE DLS IK")
     print("="*76)
     print(f"Target TCP = [{target_xyz[0]:+.4f}, {target_xyz[1]:+.4f}, {target_xyz[2]:+.4f}] m")
-    q_target = solve_full_pose(target_xyz, rpy_start, q_start)
+    q_target = solve_full_pose(target_xyz, rpy_start, q_start, tol)
     solved = fk(q_target)[:3,3]
     print(f"Solved TCP XYZ [m] = [{solved[0]:+.5f}, {solved[1]:+.5f}, {solved[2]:+.5f}]")
     print(f"FK position error = {np.linalg.norm(solved-target_xyz)*1000.0:.3f} mm")
@@ -190,6 +247,10 @@ def main():
     raw_at_object = read_raw()
     print_raw("AT OBJECT", raw_at_object)
 
+    q_at_object = raw_to_model_q(raw_at_object, session, model_home, legacy_raw_home)
+    if not completion_report("REACH COMPLETION CHECK", q_target, q_at_object, tol):
+        raise RuntimeError("Reach tolerance failed. Gripper close was NOT started.")
+
     print("\n>>> STEP 3 / 4 : GRASP OBJECT")
     j7_close = j7_open + close_travel
     print(f"Session J7 FULL OPEN = {j7_open:+.3f} deg")
@@ -199,9 +260,18 @@ def main():
 
     print("\n>>> STEP 4 / 4 : RETURN TO HUMANARM HOME")
     raw_before_return = read_raw()
-    move_raw_targets(raw_before_return, human_home_targets(session), RETURN_DURATION_SEC, "IK TARGET -> HUMANARM HOME", joints=ARM_JOINTS)
+    home_raw = human_home_targets(session)
+    move_raw_targets(raw_before_return, home_raw, RETURN_DURATION_SEC, "IK TARGET -> HUMANARM HOME", joints=ARM_JOINTS)
     raw_final = read_raw()
     print_raw("FINAL RAW", raw_final)
+
+    q_final = raw_to_model_q(raw_final, session, model_home, legacy_raw_home)
+    raw_home_vector = list(raw_final)
+    for joint in ARM_JOINTS:
+        raw_home_vector[RAW_INDEX[joint]] = float(home_raw[joint])
+    q_home_target = raw_to_model_q(raw_home_vector, session, model_home, legacy_raw_home)
+    completion_report("HOME COMPLETION CHECK", q_home_target, q_final, tol)
+
     print("\n" + "="*76)
     print(" PICK SEQUENCE COMPLETE")
     print("="*76)
