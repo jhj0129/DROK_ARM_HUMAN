@@ -4,7 +4,7 @@
   <version>0.1.0</version>
   <description>DROK ARM HumanArm mode and 1 kHz smooth IK motion.</description>
   <maintainer email="noreply@example.com">jhj0129</maintainer>
-  <license>MIT</license>
+  <license>UNLICENSED</license>
   <buildtool_depend>ament_python</buildtool_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
