@@ -1,0 +1,8 @@
+build/
+install/
+log/
+.deps/
+__pycache__/
+*.pyc
+src/drok_arm_kinematics
+src/drok_real_arm_bridge
