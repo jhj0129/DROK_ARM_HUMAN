@@ -1,0 +1,13 @@
+# DROK HumanArm default tolerances.
+# Intentionally relaxed for the mechanically rough real arm.
+# Keep these values synchronized with the MuJoCo HumanArm simulation.
+
+ik:
+  position_tolerance_m: 0.001
+  orientation_tolerance_rad: 0.008726646259971648  # 0.5 deg
+
+completion:
+  joint_tolerance_deg: 1.0
+  tcp_position_tolerance_m: 0.010
+  tcp_orientation_tolerance_deg: 5.0
+  settle_time_sec: 0.20
