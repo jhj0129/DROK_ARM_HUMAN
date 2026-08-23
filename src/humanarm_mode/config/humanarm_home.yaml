@@ -1,0 +1,8 @@
+# Physically calibrated HUMANARM Home for J1~J5.
+# J6 is intentionally NOT stored here: its absolute RAW reference is not reliable across power cycles.
+humanarm_home_raw_deg:
+  J1: 3.8733333333333335
+  J2: 104.48833333333333
+  J3: 7.8425
+  J4: -56.86
+  J5: 69.22
