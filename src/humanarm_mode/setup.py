@@ -17,7 +17,7 @@ setup(
     maintainer="jhj0129",
     maintainer_email="noreply@example.com",
     description="DROK ARM HumanArm mode: power-on session calibration, smooth 1 kHz control, and IK pick demo.",
-    license="MIT",
+    license="UNLICENSED",
     entry_points={
         "console_scripts": [
             "humanarm_motor_monitor = humanarm_mode.raw_monitor:main",
